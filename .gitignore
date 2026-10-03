@@ -1,0 +1,25 @@
+# 密钥与敏感文件 —— 绝对不能提交！
+.env
+.env.local
+*.key
+*.pem
+
+# 缓存 / 运行产物
+cache_search.json
+cache_result.json
+eval/*.partial.json
+eval/*.smoke.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+out/

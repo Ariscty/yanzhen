@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "验真 YanZhen — 划词事实核查",
+  "version": "0.2.0",
+  "description": "选中一段文字，按 Ctrl+Shift+X，基于权威来源核查它的可信度。结论 + 证据链接，不猜。支持中英双语检索与新闻模式。",
+
+  "permissions": ["storage", "contextMenus", "activeTab", "scripting"],
+
+  "host_permissions": [
+    "https://api.deepseek.com/*",
+    "https://api.tavily.com/*",
+    "https://api.bochaai.com/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+
+  "action": {
+    "default_title": "验真：核查选中的文字（Ctrl+Shift+X）"
+  },
+
+  "options_page": "options.html",
+
+  "commands": {
+    "check-selection": {
+      "suggested_key": { "default": "Ctrl+Shift+X" },
+      "description": "核查选中的文字"
+    }
+  }
+}

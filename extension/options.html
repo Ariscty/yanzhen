@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>验真 · 设置</title>
+<style>
+  body { font: 14px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+         color: #111827; max-width: 620px; margin: 28px auto; padding: 0 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #6b7280; margin-bottom: 20px; }
+  fieldset { border: 1px solid #e5e7eb; border-radius: 10px; margin: 0 0 18px; padding: 14px 16px; }
+  legend { font-weight: 700; padding: 0 6px; }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; }
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%; box-sizing: border-box; padding: 7px 9px; font-size: 13px;
+    border: 1px solid #d1d5db; border-radius: 6px; font-family: inherit; }
+  .hint { color: #6b7280; font-size: 12px; margin-top: 4px; }
+  .hint a { color: #2563eb; }
+  .row { display: flex; gap: 14px; }
+  .row > div { flex: 1; }
+  button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #d1d5db;
+           background: #fff; cursor: pointer; }
+  button.primary { background: #111827; color: #fff; border-color: #111827; }
+  button:hover { opacity: .88; }
+  #msg { margin-left: 12px; font-size: 13px; }
+  .ok { color: #16a34a; } .bad { color: #dc2626; }
+  .foot { color: #9ca3af; font-size: 12px; margin-top: 24px; }
+</style>
+</head>
+<body>
+  <h1>验真 · 设置</h1>
+  <div class="sub">填你自己的 API key —— 它们只存在这台电脑的浏览器里，不会上传到任何地方。</div>
+
+  <fieldset>
+    <legend>模型（必填）</legend>
+    <label for="deepseekKey">DeepSeek API Key</label>
+    <input type="password" id="deepseekKey" placeholder="sk-...">
+    <div class="hint">申请：<a href="https://platform.deepseek.com/" target="_blank" rel="noreferrer">platform.deepseek.com</a>（按 token 计费，一次核查约几分钱）</div>
+
+    <label for="model">模型名</label>
+    <input type="text" id="model" placeholder="deepseek-flash">
+    <div class="hint">一般不用改。<code>deepseek-flash</code> 就是 DeepSeek-V4.1-Flash。</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>搜索来源（必填，二选一）</legend>
+    <label for="provider">用哪家</label>
+    <select id="provider">
+      <option value="tavily">Tavily（国外，每月 1000 次免费，推荐先用这个）</option>
+      <option value="bocha">博查（国内中文，未实测验证）</option>
+      <option value="mock">模拟搜索（不联网，只用来测试界面）</option>
+    </select>
+
+    <label for="tavilyKey">Tavily API Key</label>
+    <input type="password" id="tavilyKey" placeholder="tvly-...">
+    <div class="hint">申请：<a href="https://app.tavily.com" target="_blank" rel="noreferrer">app.tavily.com</a>（不用信用卡）</div>
+
+    <label for="bochaKey">博查 API Key（选博查时填）</label>
+    <input type="password" id="bochaKey" placeholder="sk-...">
+    <div class="hint">这个适配器还没实测过，用不了的话把报错发我。</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>成本与严格度</legend>
+    <div class="row">
+      <div>
+        <label for="maxClaims">一次最多核查几条断言</label>
+        <input type="number" id="maxClaims" min="1" max="6">
+        <div class="hint">默认 3。调大更全面，也更贵。</div>
+      </div>
+      <div>
+        <label for="maxResults">每种语言搜几条</label>
+        <input type="number" id="maxResults" min="1" max="10">
+        <div class="hint">默认 4。中文搜一遍、英文搜一遍，所以实际是两倍。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="maxEvidence">每条断言保留几条证据</label>
+        <input type="number" id="maxEvidence" min="2" max="12">
+        <div class="hint">默认 6。按来源等级取舍：A/B 级优先占位，弱来源被挤掉。这是控制成本的关键。</div>
+      </div>
+      <div>
+        <label for="newsDays">新闻搜索时间范围（天）</label>
+        <input type="number" id="newsDays" min="0" max="365">
+        <div class="hint">默认 30。涉及"今年/最近/昨天"的断言，会额外搜一次最近 N 天的新闻。设 0 关闭。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="judgeVotes">判定跑几次取多数</label>
+        <input type="number" id="judgeVotes" min="1" max="5">
+        <div class="hint">默认 1。要紧的内容设 3 更稳，成本约翻 1.5 倍。</div>
+      </div>
+      <div>
+        <label for="cacheDays">结果缓存天数</label>
+        <input type="number" id="cacheDays" min="0" max="365">
+        <div class="hint">默认 7。同一段文字重复查结果一致且免费；设 0 关闭。</div>
+      </div>
+    </div>
+  </fieldset>
+
+  <div>
+    <button class="primary" id="save">保存</button>
+    <button id="test">测试连接</button>
+    <span id="msg"></span>
+  </div>
+
+  <div class="foot">
+    快捷键：选中文字后按 <b>Ctrl+Shift+X</b>（可在 <code>edge://extensions/shortcuts</code> 里改）。
+    也可以右键选中的文字 → 「用『验真』核查选中的文字」。
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
