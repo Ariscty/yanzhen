@@ -7,6 +7,7 @@
 # 缓存 / 运行产物
 cache_search.json
 cache_result.json
+cache_claims.json
 eval/*.partial.json
 eval/*.smoke.md
 

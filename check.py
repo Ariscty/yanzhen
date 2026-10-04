@@ -83,6 +83,62 @@ def clear_result_cache():
     except Exception:
         pass
 
+
+# ---------------------------------------------------------------- 拆断言缓存
+# 为什么必须有这一层？
+#
+# 评测的可复现性坏在**第一步**：同一段文字两次拆出的措辞略有不同
+#   → 搜索关键词变 → 检索缓存未命中 → 搜到不同证据 → 结论翻转
+# 实测证据（2026-10-04）：两次评测之间**没有任何针对某条样本的改动**，
+# 它自己从"判错"变成了"判对" —— 噪声下限至少 ±1 条。
+# 于是所有"改动到底有没有效"的判断都失去了意义。
+#
+# 把拆断言的结果按文本固定下来，A/B 对比一次改动才谈得上干净。
+#
+# ⚠️ SPLIT_VERSION 只在【第一步的提示词或参数】变化时 +1。
+#    千万不要跟着 PROMPT_VERSION 一起动 —— 否则改判定提示词会把已经固定的
+#    拆断言一并冲掉，噪声又回来了，而你会以为是自己改的规则起了作用。
+SPLIT_VERSION = "1"
+CLAIM_CACHE_FILE = pathlib.Path(__file__).resolve().parent / "cache_claims.json"
+_CLAIM_CACHE = None
+
+
+def _load_claim_cache():
+    global _CLAIM_CACHE
+    if _CLAIM_CACHE is None:
+        try:
+            _CLAIM_CACHE = json.loads(CLAIM_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _CLAIM_CACHE = {}
+    return _CLAIM_CACHE
+
+
+def _save_claim_cache():
+    try:
+        CLAIM_CACHE_FILE.write_text(
+            json.dumps(_CLAIM_CACHE, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _claim_key(cfg, text):
+    raw = "|".join([
+        SPLIT_VERSION,
+        _normalize_text(text),
+        str(cfg.get("MAX_CLAIMS")),
+        str(cfg.get("DEEPSEEK_MODEL")),
+    ])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def clear_claim_cache():
+    global _CLAIM_CACHE
+    _CLAIM_CACHE = {}
+    try:
+        CLAIM_CACHE_FILE.unlink()
+    except Exception:
+        pass
+
 VERDICT_LABEL = {
     "supported": "可信",
     "refuted": "与事实不符",
@@ -191,8 +247,23 @@ STEP3_SYSTEM = """你是事实核查的第二步：基于证据下结论。
 {{"results":[{{"claim":"断言原文","verdict":"supported|refuted|insufficient|mixed","confidence":0.0,"reason":"判定依据","sources":[{{"url":"网址","title":"标题"}}]}}]}}"""
 
 
-def extract_claims(cfg, text):
-    """第一步：拆断言。返回 (claims列表, usage)。"""
+def extract_claims(cfg, text, use_cache=True):
+    """第一步：拆断言。返回 (claims列表, usage)。
+
+    use_cache=True 时按文本缓存拆分结果，保证同一段文字每次拆出**完全一样**的
+    断言和关键词（见上面「拆断言缓存」那段说明）。命中缓存时 usage 返回 {}。
+    """
+    try:
+        days = float(cfg.get("CACHE_DAYS", "7") or 0)
+    except Exception:
+        days = 7.0
+
+    key = _claim_key(cfg, text)
+    if use_cache and days > 0:
+        hit = _load_claim_cache().get(key)
+        if hit and time.time() - hit.get("t", 0) < days * 86400:
+            return hit.get("claims", []), {}
+
     prompt = STEP1_SYSTEM.format(max_claims=cfg.get("MAX_CLAIMS", "3"))
     raw, usage = llm.chat(cfg, prompt, text, max_tokens=2048, temperature=0.0)
     data = llm.parse_json(raw)
@@ -211,6 +282,10 @@ def extract_claims(cfg, text):
             "query_en": (c.get("query_en") or "").strip(),
             "time_sensitive": bool(c.get("time_sensitive")),
         })
+
+    if use_cache and days > 0 and clean:
+        _load_claim_cache()[key] = {"t": time.time(), "claims": clean}
+        _save_claim_cache()
     return clean, usage
 
 
@@ -327,20 +402,53 @@ def gather_evidence(cfg, claims, on_progress=None, max_workers=4):
     return claims
 
 
+class JudgeParseError(Exception):
+    """判定模型吐出的 JSON 三级兜底都救不回来。"""
+
+    def __init__(self, msg, usage=None):
+        super().__init__(msg)
+        self.usage = usage or {}
+
+
+def _repair_json(raw):
+    """尽力从模型输出里救出 JSON：去掉 ``` 围栏、截取最外层 {}。"""
+    s = (raw or "").strip()
+    s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    i, j = s.find("{"), s.rfind("}")
+    if i >= 0 and j > i:
+        s = s[i:j + 1]
+    return s
+
+
 def _judge_once(cfg, user):
-    """跑一次判定，返回 (results, usage)。JSON 不合法时自动重试一次。"""
+    """跑一次判定，返回 (results, usage)。
+
+    模型偶尔会吐出不完整/不合法的 JSON（回答一长就容易截断），所以有三级兜底：
+      ① 原样解析
+      ② 追加一句"必须输出合法完整 JSON"后重试
+      ③ 去掉 ``` 围栏、截取最外层 {} 再试一次
+    三级都失败才抛 JudgeParseError。
+
+    **绝不能因为模型吐了坏 JSON 就让整条核查崩掉** —— 评测里真踩到过，
+    一条样本直接报错、白花前面所有的钱。由 judge() 接着降级成"无法判定"。
+    """
     raw, usage = llm.chat(cfg, STEP3_SYSTEM, user, max_tokens=6144, temperature=0.0)
     try:
         data = llm.parse_json(raw)
     except Exception:
-        # 模型偶尔会吐出不完整的 JSON（回答一长就容易截断）。
-        # 评测时真的踩到过一次：整条样本直接报错。这里重试一次，并把 token 记账合并。
         raw2, usage2 = llm.chat(
             cfg, STEP3_SYSTEM,
             user + "\n\n重要：请严格输出合法完整的 JSON，不要有任何多余文字，不要截断。",
             max_tokens=8192, temperature=0.0)
-        data = llm.parse_json(raw2)
         usage = _merge_usage(usage, usage2)
+        try:
+            data = llm.parse_json(raw2)
+        except Exception:
+            try:
+                data = llm.parse_json(_repair_json(raw2))
+            except Exception as e:
+                raise JudgeParseError("%s: %s" % (type(e).__name__, e), usage)
     return normalize(data.get("results") or []), usage
 
 
@@ -375,7 +483,21 @@ def judge(cfg, claims, votes=None):
 
     runs, usages = [], []
     for _ in range(n):
-        res, u = _judge_once(cfg, user)
+        try:
+            res, u = _judge_once(cfg, user)
+        except JudgeParseError as e:
+            # 模型吐了坏 JSON，三级兜底都没救回来。
+            # 这里**绝不往上抛** —— 一条样本崩掉会浪费前面所有的检索和模型调用。
+            # 老实说"无法判定"才是这个工具该有的态度（查不到就直说，不猜）。
+            usages.append(getattr(e, "usage", {}))
+            runs.append([{
+                "claim": c["claim"],
+                "verdict": "insufficient",
+                "confidence": 0.0,
+                "reason": "模型输出无法解析（已重试并尝试修复），不作判定：%s" % e,
+                "sources": [],
+            } for c in claims])
+            continue
         runs.append(res)
         usages.append(u)
 
