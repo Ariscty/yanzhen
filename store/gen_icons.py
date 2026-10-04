@@ -133,18 +133,30 @@ def main():
         pass
 
     here = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(os.path.dirname(here), "extension", "icons")
-    os.makedirs(out_dir, exist_ok=True)
+    root = os.path.dirname(here)
 
+    # ① 扩展本体用的图标 → extension/icons/
+    out_dir = os.path.join(root, "extension", "icons")
+    os.makedirs(out_dir, exist_ok=True)
     for size in (16, 32, 48, 128):
         rows = render(size)
         path = os.path.join(out_dir, "icon%d.png" % size)
         write_png(path, size, rows)
-        print("  %-28s %d x %d  %d bytes" % (
-            os.path.relpath(path, os.path.dirname(here)), size, size,
-            os.path.getsize(path)))
+        print("  %-34s %d x %d  %d bytes" % (
+            os.path.relpath(path, root), size, size, os.path.getsize(path)))
 
-    print("\n图标已生成到 extension/icons/")
+    # ② 商店要的徽标 → store/assets/  （Edge 要求 1:1，推荐 300x300，最小 128x128）
+    asset_dir = os.path.join(here, "assets")
+    os.makedirs(asset_dir, exist_ok=True)
+    for size in (300, 512):
+        rows = render(size)
+        path = os.path.join(asset_dir, "logo-%d.png" % size)
+        write_png(path, size, rows)
+        print("  %-34s %d x %d  %d bytes" % (
+            os.path.relpath(path, root), size, size, os.path.getsize(path)))
+
+    print("\n扩展图标 → extension/icons/")
+    print("商店徽标 → store/assets/")
 
 
 if __name__ == "__main__":

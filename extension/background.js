@@ -40,9 +40,13 @@ function checkConfig(cfg) {
 // ---------------------------------------------------------------- 缓存
 // 缓存整条核查结果：同一段文字重复查询结果一致，第二次还免费。
 // （命令行版踩过的坑：拆断言的措辞每次略不同 → 搜索关键词变 → 结论翻转）
+//
+// ⚠️ 开头那个数字是缓存版本。**改了检索或判定流程就要 +1**，
+//    否则同一段文字会命中旧结论 —— 用户以为工具没进步，其实是缓存没失效。
+//    v7：多了一路「辟谣 / fact check」检索，检索改为并发发出。
 function hashKey(cfg, text) {
   const norm = (text || '').toLowerCase().replace(/[\s，,。.、·:：;；!！?？"'“”‘’()（）[\]【】\-—_/\\]/g, '');
-  const raw = [6, norm, cfg.provider, cfg.maxClaims, cfg.maxResults, cfg.maxEvidence,
+  const raw = [7, norm, cfg.provider, cfg.maxClaims, cfg.maxResults, cfg.maxEvidence,
     cfg.newsDays, cfg.judgeVotes, cfg.model].join('|');
   let h = 5381;
   for (let i = 0; i < raw.length; i++) h = ((h << 5) + h + raw.charCodeAt(i)) | 0;

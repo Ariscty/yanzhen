@@ -10,6 +10,7 @@
 """
 import json
 import pathlib
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -141,24 +142,37 @@ PROVIDERS = {
 # 所以这里把检索结果落盘缓存：同样的 query 直接复用，保证可复现，顺带省钱。
 CACHE_FILE = pathlib.Path(__file__).resolve().parent / "cache_search.json"
 _CACHE = None
+# 并发检索（check.gather_evidence 用线程池）会同时读写这个缓存。
+# 不加锁的话，两次 write_text 可能交错，整个 cache_search.json 会变成坏 JSON，
+# 之后所有查询都会静默退化成"每次都重新搜"。用 RLock 是因为写入路径要嵌套调用。
+_CACHE_LOCK = threading.RLock()
 
 
 def _load_cache():
     global _CACHE
-    if _CACHE is None:
-        try:
-            _CACHE = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            _CACHE = {}
-    return _CACHE
+    with _CACHE_LOCK:
+        if _CACHE is None:
+            try:
+                _CACHE = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                _CACHE = {}
+        return _CACHE
 
 
 def _save_cache():
-    try:
-        CACHE_FILE.write_text(json.dumps(_CACHE, ensure_ascii=False),
-                              encoding="utf-8")
-    except Exception:
-        pass
+    with _CACHE_LOCK:
+        try:
+            CACHE_FILE.write_text(json.dumps(_CACHE, ensure_ascii=False),
+                                  encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _cache_put(key, value):
+    """线程安全地写入一条缓存并落盘。"""
+    with _CACHE_LOCK:
+        _load_cache()[key] = value
+        _save_cache()
 
 
 def cache_stats():
@@ -168,11 +182,12 @@ def cache_stats():
 
 def clear_cache():
     global _CACHE
-    _CACHE = {}
-    try:
-        CACHE_FILE.unlink()
-    except Exception:
-        pass
+    with _CACHE_LOCK:
+        _CACHE = {}
+        try:
+            CACHE_FILE.unlink()
+        except Exception:
+            pass
 
 
 def web_search(cfg, query, limit=5, use_cache=True, news_days=None):
@@ -197,7 +212,5 @@ def web_search(cfg, query, limit=5, use_cache=True, news_days=None):
     results = fn(cfg, query, limit, news_days)
 
     if use_cache and days > 0 and results:
-        cache = _load_cache()
-        cache[key] = {"t": time.time(), "r": results}
-        _save_cache()
+        _cache_put(key, {"t": time.time(), "r": results})
     return results

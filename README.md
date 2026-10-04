@@ -300,7 +300,8 @@ python eval/run_eval.py --yes         # 跑全部 19 条
 | [`store/SUBMIT.md`](store/SUBMIT.md) | **从零到过审的完整步骤**，含常见被拒原因 |
 | [`store/listing.md`](store/listing.md) | 商店文案（中英双语）+ 逐条权限说明 + 隐私问卷答案 |
 | [`store/pack.py`](store/pack.py) | 打包脚本：`python store/pack.py`，自检不过就不出包 |
-| [`store/test_core.py`](store/test_core.py) | **内核自测**：借 Edge 的 JS 引擎真跑 `core.js`，验证分级/引用校验/判定优先级 + 三个 JS 文件的语法 |
+| [`store/test_core.mjs`](store/test_core.mjs) | **内核自测（推荐）**：`node store/test_core.mjs`。直接 import `core.js` 跑断言，验证分级 / 辟谣关键词 / 引用校验 / 判定优先级 + 四个 JS 文件的语法。不需要浏览器 |
+| [`store/test_core.py`](store/test_core.py) | 同样这些检查，但借 **Edge 无头模式**执行——**没装 Node 时**的备选。缺点是写死了 Windows 下 Edge 的路径 |
 | [`store/check_secrets.py`](store/check_secrets.py) | **公开前自检**：拿 `.env` 里的真实密钥比对整个 git 历史，确认没泄露过 |
 | [`store/gen_icons.py`](store/gen_icons.py) | 图标生成器（纯标准库，改几何参数即可换设计） |
 | [`PRIVACY.md`](PRIVACY.md) | 隐私政策，上架时填这个文件的 GitHub 链接 |

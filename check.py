@@ -7,9 +7,11 @@
     3. judge           把「断言 + 分级后的证据」交给模型判定
     4. verify_sources  硬闸门：模型引用的网址必须真的在检索结果里，否则剔除
 """
+import concurrent.futures
 import hashlib
 import json
 import pathlib
+import re
 import time
 
 import llm
@@ -27,7 +29,9 @@ import sources
 # 同一段文字永远得到同一个答案，第二次核查还完全免费。
 #
 # ⚠️ 改提示词或改流程之后，必须把 PROMPT_VERSION +1，否则会命中旧结论。
-PROMPT_VERSION = "7"
+#    注意「流程」不只有提示词 —— 检索策略（几路查询、关键词怎么拼）也算。
+#    v8：多了一路「辟谣 / fact check」检索，检索改为并发发出。
+PROMPT_VERSION = "8"
 RESULT_CACHE_FILE = pathlib.Path(__file__).resolve().parent / "cache_result.json"
 _RESULT_CACHE = None
 
@@ -220,13 +224,37 @@ def _pick(pool, cap):
     return picked
 
 
-def gather_evidence(cfg, claims, on_progress=None):
+_HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _fact_check_query(c):
+    """给每条断言多配一路「辟谣 / fact check」检索。
+
+    为什么值得多搜这一路：事实核查类站点（中国互联网联合辟谣平台、腾讯较真、
+    Snopes、FactCheck.org）在搜索结果里本来就排得靠前，但**必须用对关键词**才能
+    把它们勾出来 —— 用断言原话去搜，往往搜到的还是原始谣言本身。
+    多一次检索的成本，换"有没有人已经核查过这句话"的直接答案，很划算。
+    """
+    q = (c.get("query") or c.get("claim") or "").strip()
+    if not q:
+        return ""
+    if _HAS_CJK.search(q):
+        return q + " 辟谣 真相"
+    return q + " fact check"
+
+
+def gather_evidence(cfg, claims, on_progress=None, max_workers=4):
     """第二步：每条断言去搜网页。
 
-    对每条断言最多搜三次：
+    对每条断言最多搜四次：
       1. 中文关键词
       2. 英文关键词（科普/健康/科学类内容，英文资料质量明显更好）
-      3. 若这条断言涉及近期事件且开了新闻模式 → 再加一次新闻搜索（带时间范围）
+      3. 辟谣 / fact check 关键词（直接去找有没有人已经核查过这句话）
+      4. 若这条断言涉及近期事件且开了新闻模式 → 再加一次新闻搜索（带时间范围）
+
+    这几路检索之间**没有任何依赖**，所以并发发出。串行跑纯属白等：
+    一次核查 6~9 路检索，串行要十几秒，并发后只剩最慢那一路的时间。
+    限并发 4 —— 搜索服务有限流，一次全发出去容易吃 429。
 
     结果合并去重后按来源等级排序、截断，挂在 claim["evidence"] 上。
     """
@@ -237,29 +265,48 @@ def gather_evidence(cfg, claims, on_progress=None):
     except Exception:
         news_days = 0
 
-    for c in claims:
-        queries = []
+    # ① 摊平所有检索任务
+    jobs = []
+    for idx, c in enumerate(claims):
         q = c["query"] or c["claim"]
-        queries.append((q, None, "中文"))
+        queries = [(q, None, "中文")]
         qe = c.get("query_en") or ""
         if qe and _norm_query(qe) != _norm_query(q):
             queries.append((qe, None, "英文"))
+        fq = _fact_check_query(c)
+        if fq and _norm_query(fq) not in (_norm_query(q), _norm_query(qe)):
+            queries.append((fq, None, "辟谣"))
         if c.get("time_sensitive") and news_days > 0:
             queries.append((q, news_days, "新闻"))
-
-        pool = []
+        c["queries"] = ["%s:%s" % (m, qq) for qq, _, m in queries]
         for query, days, mode in queries:
+            jobs.append((idx, query, days, mode))
+
+    # ② 并发检索。结果按任务序号收集，最后仍按原顺序拼装：
+    #    _pick 的排序是稳定的，同等级来源之间靠输入顺序取舍 ——
+    #    不按序号回收的话，证据顺序会随线程完成顺序变化，结论就不可复现了。
+    got = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {}
+        for n, (idx, query, days, mode) in enumerate(jobs):
             if on_progress:
-                on_progress(c, "[%s] %s" % (mode, query))
+                on_progress(claims[idx], "[%s] %s" % (mode, query))
+            futs[ex.submit(search.web_search, cfg, query, limit, True, days)] = n
+        for fut in concurrent.futures.as_completed(futs):
+            n = futs[fut]
+            idx = jobs[n][0]
             try:
-                for r in search.web_search(cfg, query, limit, news_days=days):
-                    pool.append(sources.annotate(r))
+                got[n] = [sources.annotate(r) for r in fut.result()]
             except search.SearchError:
                 raise
             except Exception as e:
-                c["search_error"] = "%s: %s" % (type(e).__name__, e)
+                claims[idx]["search_error"] = "%s: %s" % (type(e).__name__, e)
 
-        c["queries"] = ["%s:%s" % (m, qq) for qq, _, m in queries]
+    # ③ 按任务顺序拼回证据池，再按来源等级取舍
+    pools = [[] for _ in claims]
+    for n, (idx, _q, _days, _mode) in enumerate(jobs):
+        pools[idx].extend(got.get(n, []))
+    for c, pool in zip(claims, pools):
         c["evidence"] = _pick(pool, cap)
     return claims
 

@@ -54,7 +54,11 @@ def run_one(cfg, case):
     """
     t0 = time.time()
     try:
-        claims, results, usages = check.run(cfg, case["text"])
+        # use_cache=False：评测必须测**当前这份代码**。
+        # 结果缓存是为了产品端"同一段文字别重复花钱"，但对评测是毒药 ——
+        # 19 条样本跑过一次后全进了缓存，之后不管你改什么，
+        # 第二次评测都会原样返回旧结论，让人误以为"改动没效果"。
+        claims, results, usages = check.run(cfg, case["text"], use_cache=False)
     except Exception as e:
         return None, [], "%s: %s" % (type(e).__name__, e), 0, time.time() - t0
     if not claims:

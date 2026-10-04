@@ -5,7 +5,10 @@
 //   - 方便单独调试
 // 浏览器相关的事情（storage、消息、渲染）都留给 background.js 和 content.js。
 
-export const PROMPT_VERSION = '7';
+// ⚠️ 改提示词或改流程之后必须 +1（检索策略也算「流程」）。
+//    这个值和 Python 版 check.py 的 PROMPT_VERSION 必须保持一致。
+//    v8：多了一路「辟谣 / fact check」检索，检索改为并发发出。
+export const PROMPT_VERSION = '8';
 
 // ============================================================ 来源分级
 // 中文互联网上，「一份政府公告」和「一条自媒体转述」是完全不同强度的证据。
@@ -452,6 +455,16 @@ function normQuery(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
 }
 
+// 给每条断言多配一路「辟谣 / fact check」检索。
+// 事实核查类站点（中国互联网联合辟谣平台、腾讯较真、Snopes、FactCheck.org）
+// 在搜索结果里本来就排得靠前，但**必须用对关键词**才能勾出来 ——
+// 用断言原话去搜，往往搜到的还是原始谣言本身。
+function factCheckQuery(c) {
+  const q = String(c.query || c.claim || '').trim();
+  if (!q) return '';
+  return /[\u4e00-\u9fff]/.test(q) ? `${q} 辟谣 真相` : `${q} fact check`;
+}
+
 // ============================================================ 流水线
 function normalize(results) {
   const ok = Object.keys(VERDICT_LABEL);
@@ -576,34 +589,57 @@ export async function checkText(cfg, text, onProgress) {
   if (!claims.length) return { claims: [], results: [], usages };
 
   // 第二步：检索 + 来源分级
-  // 每条断言最多搜三次：①中文关键词 ②英文关键词 ③涉及近期事件时走新闻模式
+  // 每条断言最多搜四次：①中文关键词 ②英文关键词
+  //                      ③辟谣/fact check ④涉及近期事件时走新闻模式
+  // 这几路之间**没有任何依赖**，所以并发发出。
+  // （原来是 claims × queries 两层 for + await，6~9 路串行，白等十几秒。）
   say('search');
-  for (const c of claims) {
-    const plan = [[c.query || c.claim, null, '中文']];
-    if (c.query_en && normQuery(c.query_en) !== normQuery(c.query)) {
+  const jobs = [];
+  claims.forEach((c, ci) => {
+    const q = c.query || c.claim;
+    const plan = [[q, null, '中文']];
+    if (c.query_en && normQuery(c.query_en) !== normQuery(q)) {
       plan.push([c.query_en, null, '英文']);
     }
+    const fq = factCheckQuery(c);
+    if (fq && normQuery(fq) !== normQuery(q)
+        && normQuery(fq) !== normQuery(c.query_en || '')) {
+      plan.push([fq, null, '辟谣']);
+    }
     if (c.time_sensitive && Number(cfg.newsDays) > 0) {
-      plan.push([c.query || c.claim, Number(cfg.newsDays), '新闻']);
+      plan.push([q, Number(cfg.newsDays), '新闻']);
     }
+    c.queries = plan.map(([qq, , mode]) => `${mode}:${qq}`);
+    plan.forEach(([qq, days, mode]) => jobs.push({ ci, q: qq, days, mode, err: '' }));
+  });
 
-    const pool = [];
-    const used = [];
-    for (const [q, days, mode] of plan) {
-      used.push(`${mode}:${q}`);
-      say('searching', `[${mode}] ${q}`);
+  say('searching', `并发检索 ${jobs.length} 路…`);
+  const got = new Array(jobs.length).fill(null);
+  // 限并发 4：搜索服务有限流，一次全发出去容易吃 429
+  const MAX_PARALLEL = 4;
+  for (let i = 0; i < jobs.length; i += MAX_PARALLEL) {
+    await Promise.all(jobs.slice(i, i + MAX_PARALLEL).map(async (j, k) => {
+      const n = i + k;
       try {
-        const raw = await webSearch(cfg, q, cfg.maxResults, days);
-        for (const r of raw) pool.push(annotate(r));
+        got[n] = (await webSearch(cfg, j.q, cfg.maxResults, j.days)).map(annotate);
       } catch (e) {
-        c.searchError = String(e.message || e);
-        // key 没填 / 权限有问题，直接报错，不要装作"证据不足"
-        if (/key|HTTP 401|HTTP 403/i.test(c.searchError)) throw e;
+        j.err = String(e.message || e);
       }
-    }
-    c.queries = used;
-    c.evidence = pickEvidence(pool, Number(cfg.maxEvidence) || 6);
+    }));
   }
+  // key / 权限问题直接抛，不要装作"证据不足"
+  for (const j of jobs) {
+    if (j.err && /key|HTTP 401|HTTP 403/i.test(j.err)) throw new Error(j.err);
+  }
+  // 按任务序号拼回证据池：pickEvidence 的排序是稳定的，
+  // 不按序号回收的话，证据顺序会随完成顺序变化，结论就不可复现了。
+  const pools = claims.map(() => []);
+  jobs.forEach((j, n) => { for (const r of (got[n] || [])) pools[j.ci].push(r); });
+  claims.forEach((c, i) => {
+    c.evidence = pickEvidence(pools[i], Number(cfg.maxEvidence) || 6);
+    const bad = jobs.find((j) => j.ci === i && j.err);
+    if (bad) c.searchError = bad.err;
+  });
 
   // 第三步：判定（可选多次取多数）
   say('judge');
