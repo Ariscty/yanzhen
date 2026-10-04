@@ -10,6 +10,10 @@ cache_result.json
 eval/*.partial.json
 eval/*.smoke.md
 
+# 商店打包产物（用 store/pack.py 重新生成即可，不入库）
+dist/
+*.zip
+
 # Python
 __pycache__/
 *.py[cod]
