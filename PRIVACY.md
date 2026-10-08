@@ -20,7 +20,8 @@
 |---|---|---|---|
 | 1 | **你选中的那段文字** | DeepSeek（`api.deepseek.com`） | 拆分成可核查的断言，并生成检索关键词 |
 | 2 | **检索关键词**（由第 1 步从原文生成，可能包含原文片段） | Tavily（`api.tavily.com`）或 博查（`api.bochaai.com`）——**只用你在设置里选的那一家** | 搜索相关证据 |
-| 3 | **搜索到的网页标题、摘要、链接** + 断言文字 | DeepSeek（`api.deepseek.com`） | 依据证据作出判定 |
+| 2b | **搜索命中的网页网址**（不含你选中的文字） | Tavily（`api.tavily.com`） | 抓取这些网页的正文，让模型看到原文而不只是摘要。可在设置里关掉 |
+| 3 | **搜索到的网页标题、正文（或摘要）、链接** + 断言文字 | DeepSeek（`api.deepseek.com`） | 依据证据作出判定 |
 
 除此之外，**没有任何数据被发送到其他地方**。本扩展没有作者自建的服务器。
 
@@ -89,7 +90,8 @@ Selected text is sent only to the two API providers **you** configure.
 |---|---|---|---|
 | 1 | The text you selected | DeepSeek (`api.deepseek.com`) | Split into checkable claims; generate search keywords |
 | 2 | The search keywords (generated from the text; may contain fragments of it) | Tavily (`api.tavily.com`) or Bocha (`api.bochaai.com`) — whichever you selected | Retrieve evidence |
-| 3 | Retrieved titles, snippets, URLs + the claims | DeepSeek (`api.deepseek.com`) | Produce the verdict |
+| 2b | The **URLs of the pages found** (not the text you selected) | Tavily (`api.tavily.com`) | Fetch those pages' full text so the model sees the source rather than a snippet. Can be turned off in settings |
+| 3 | Retrieved titles, page text (or snippets), URLs + the claims | DeepSeek (`api.deepseek.com`) | Produce the verdict |
 
 Nothing is sent anywhere else. The extension has no developer-operated server.
 

@@ -138,6 +138,9 @@ D_DOMAINS = (
     "weibo.com", "weixin.qq.com", "mp.weixin.qq.com", "zhihu.com",
     "baijiahao.baidu.com", "baike.baidu.com", "wikipedia.org",
     "toutiao.com", "sohu.com", "163.com", "qq.com", "sina.com.cn",
+    # sina.cn 是新浪的另一个域名（news.sina.cn 等），和 sina.com.cn 是两个后缀，
+    # 不单独列出来的话会漏成"未分级"。实测在检索结果里真出现过 news.sina.cn。
+    "sina.cn",
     "ifeng.com", "jianshu.com", "csdn.net", "douyin.com",
     "xiaohongshu.com", "bilibili.com", "tieba.baidu.com", "douban.com",
     "so.com", "hao123.com", "xueqiu.com", "youtube.com", "facebook.com",

@@ -60,12 +60,27 @@ def run_one(cfg, case):
         # 第二次评测都会原样返回旧结论，让人误以为"改动没效果"。
         claims, results, usages = check.run(cfg, case["text"], use_cache=False)
     except Exception as e:
-        return None, [], "%s: %s" % (type(e).__name__, e), 0, time.time() - t0
-    if not claims:
-        return "insufficient", [], "没有拆出可核查的断言", 0, time.time() - t0
+        return None, [], "%s: %s" % (type(e).__name__, e), 0, time.time() - t0, (0, 0, 0)
+    if not claims and not results:
+        return "insufficient", [], "没有拆出可核查的断言", 0, time.time() - t0, (0, 0, 0)
     got = check.overall_verdict(results)
     usage = check.summarize_usage(usages)["total_tokens"]
-    return got, results, None, usage, time.time() - t0
+    return got, results, None, usage, time.time() - t0, fulltext_stats(claims)
+
+
+def fulltext_stats(claims):
+    """数一下这次核查真的抓到了几页正文。
+
+    必须从**这一步手上真正的 claims** 里数，不能回头再调一次 extract_claims ——
+    那样读到的是缓存的副本，而且会被同进程里已经改写过的对象干扰。
+    （第一版就是这么写的，结果"关全文"的那一臂也显示"全文 6/12 条"，
+    数字完全是假的。计量工具本身出错，比没有计量更危险。）
+
+    没有这个数，就分不清"全文抓取没提升准确率"和"全文压根没抓上"。
+    """
+    ev = [e for c in claims for e in (c.get("evidence") or [])]
+    full = [e for e in ev if e.get("fulltext")]
+    return len(ev), len(full), sum(len(e.get("content") or "") for e in ev)
 
 
 def dump_partial(rows, path):
@@ -154,12 +169,18 @@ def main():
             total_tokens += r.get("tokens", 0)
             print("[%d/%d] %s ⏭ 复用上次结果（判成 %s）"
                   % (i, len(cases), cid, LABEL.get(r["got"], r["got"])))
+            # ⚠️ 复用路径也要落盘。原来这里直接 continue 跳过 dump_partial，
+            # 于是 `--resume --redo <id>` 会把 .partial.json 覆盖成
+            # "只跑到被重跑那条为止"的前几行，**把之前跑好的全部数据删掉**。
+            # 实测踩过：两臂各 19 条的完整结果被截成 4 条。
+            dump_partial(rows, report_path.with_suffix(".partial.json"))
             continue
 
         print("[%d/%d] %s（期望 %s）… " % (i, len(cases), cid, LABEL.get(exp, exp)),
               end="", flush=True)
-        got, results, err, tokens, elapsed = run_one(cfg, case)
+        got, results, err, tokens, elapsed, dose = run_one(cfg, case)
         total_tokens += tokens
+        n_ev, n_full, n_chars = dose
 
         ok = (got == exp)
         if ok:
@@ -167,6 +188,7 @@ def main():
         rows.append({
             "id": cid, "expected": exp, "got": got, "ok": ok,
             "error": err, "tokens": tokens, "elapsed": elapsed,
+            "ev_n": n_ev, "fulltext_n": n_full, "ev_chars": n_chars,
             "text": case.get("text", ""),
             "basis_url": case.get("basis_url", ""),
             "basis_source": case.get("basis_source", ""),
@@ -176,8 +198,8 @@ def main():
         if err:
             print("❌ 出错：%s" % err)
         else:
-            print("%s 判成 %s（%.1fs）" % ("✅" if ok else "❌",
-                                          LABEL.get(got, got), elapsed))
+            print("%s 判成 %s（全文 %d/%d 条，%.1fs）"
+                  % ("✅" if ok else "❌", LABEL.get(got, got), n_full, n_ev, elapsed))
         dump_partial(rows, report_path.with_suffix(".partial.json"))
 
     acc = correct / len(cases) * 100 if cases else 0
@@ -197,16 +219,26 @@ def write_report(rows, acc, total_tokens, cfg, report_path):
     lines.append("- 准确率：**%.1f%%**" % acc)
     lines.append("- 总 token：%d" % total_tokens)
     lines.append("- 搜索来源：%s" % cfg.get("SEARCH_PROVIDER"))
+    lines.append("- 判定票数 JUDGE_VOTES：%s" % cfg.get("JUDGE_VOTES"))
+    lines.append("- 全文抓取 FULLTEXT：%s（PROMPT_VERSION %s）"
+                 % (cfg.get("FULLTEXT"), check.PROMPT_VERSION))
+    tot_full = sum(r.get("fulltext_n") or 0 for r in rows)
+    tot_ev = sum(r.get("ev_n") or 0 for r in rows)
+    tot_chars = sum(r.get("ev_chars") or 0 for r in rows)
+    lines.append("- 实际抓到正文：%d / %d 条证据，正文合计 %d 字"
+                 % (tot_full, tot_ev, tot_chars))
     lines.append("")
     lines.append("## 逐条结果")
     lines.append("")
-    lines.append("| id | 期望 | 实际 | 结果 | 耗时 |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| id | 期望 | 实际 | 结果 | 全文/证据 | 耗时 |")
+    lines.append("|---|---|---|---|---|---|")
     for r in rows:
-        lines.append("| %s | %s | %s | %s | %.1fs |"
+        lines.append("| %s | %s | %s | %s | %d/%d | %.1fs |"
                      % (r["id"], LABEL.get(r["expected"], r["expected"]),
                         LABEL.get(r["got"], r["got"] or "出错"),
-                        "✅" if r["ok"] else "❌", r["elapsed"]))
+                        "✅" if r["ok"] else "❌",
+                        r.get("fulltext_n") or 0, r.get("ev_n") or 0,
+                        r["elapsed"]))
 
     wrong = [r for r in rows if not r["ok"]]
     lines += ["", "## 判错的样本（重点看这些）", ""]

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "验真 YanZhen — 划词事实核查",
-  "version": "0.6.0",
-  "description": "选中一段文字，按 Ctrl+Shift+X，基于权威来源核查它的可信度。结论 + 证据链接，不猜。支持中英双语检索与新闻模式。",
+  "version": "0.8.0",
+  "description": "选中一段文字，按 Ctrl+Shift+X，基于权威来源核查它的可信度。结论 + 证据链接，不猜。支持中英双语检索、新闻模式与网页正文抓取。",
 
   "icons": {
     "16": "icons/icon16.png",

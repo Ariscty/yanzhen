@@ -16,13 +16,28 @@ const DEFAULTS = {
   newsDays: 30,       // 近期事件追加新闻搜索的时间范围；0 = 关闭
   judgeVotes: 1,
   cacheDays: 7,
+  // ---- 全文抓取 ----
+  // 搜索只给摘要片段，关键限定词常常不在摘要里。打开后对够格下结论的来源
+  // （默认 A/B 级）再抓一次网页正文，让模型看原文。
+  fulltext: 1,          // 1 = 抓正文；0 = 只看搜索摘要
+  fulltextMax: 3,       // 每条断言最多抓几页（控制 token）
+  fulltextChars: 3000,  // 每页正文截断到多少字
+  fulltextTiers: 'A,B', // 只对这些等级抓正文
+  // ---- 检索范围 ----
+  // 辟谣路的站点定向。Tavily 的 include_domains 是**硬过滤**（实测：不存在的域名
+  // 返回 0 条，连 gov.cn 配辟谣查询也是 0 条），所以只给辟谣路用 —— 它空了
+  // 还有中文/英文/新闻三路兜底。对中文/英文路定向是拿召回换精准，风险大得多。
+  factCheckDomains: 'piyao.org.cn,kepuchina.cn,fact.qq.com',
+  // 排除内容农场。机制是**腾出结果位**：max_results 固定几个位子，
+  // 垃圾占一个就少一个权威来源（实测低钠盐那条 A/B 级从 1/5 升到 2/5）。
+  excludeDomains: 'baijiahao.baidu.com,csdn.net,jianshu.com,sohu.com,163.com,toutiao.com,ifeng.com',
 };
 
 async function getConfig() {
   const stored = await chrome.storage.local.get(Object.keys(DEFAULTS));
   const cfg = Object.assign({}, DEFAULTS, stored);
   for (const k of ['maxClaims', 'maxResults', 'maxEvidence', 'newsDays',
-    'judgeVotes', 'cacheDays']) {
+    'judgeVotes', 'cacheDays', 'fulltext', 'fulltextMax', 'fulltextChars']) {
     cfg[k] = Number(cfg[k]);
     if (!isFinite(cfg[k])) cfg[k] = DEFAULTS[k];
   }
@@ -45,10 +60,17 @@ function checkConfig(cfg) {
 //    否则同一段文字会命中旧结论 —— 用户以为工具没进步，其实是缓存没失效。
 //    v7：多了一路「辟谣 / fact check」检索，检索改为并发发出。
 //    v8：判定提示词加「权威冲突必须判 insufficient」规则。
+//    v9：证据不再只有搜索摘要 —— 抓网页正文，判定看到的是原文。
+//        所以 fulltext 参数进了 key：同一段文字在"只看摘要"和"看全文"下
+//        拿到的证据不同，结论可能不同，必须分开缓存，否则会串味。
+//    v10：检索侧多了「辟谣路站点定向」和「排除内容农场」—— 搜回来的网页会变，
+//        所以这两个参数也必须进 key。
 function hashKey(cfg, text) {
   const norm = (text || '').toLowerCase().replace(/[\s，,。.、·:：;；!！?？"'“”‘’()（）[\]【】\-—_/\\]/g, '');
-  const raw = [8, norm, cfg.provider, cfg.maxClaims, cfg.maxResults, cfg.maxEvidence,
-    cfg.newsDays, cfg.judgeVotes, cfg.model].join('|');
+  const raw = [10, norm, cfg.provider, cfg.maxClaims, cfg.maxResults, cfg.maxEvidence,
+    cfg.newsDays, cfg.judgeVotes, cfg.model, cfg.fulltext, cfg.fulltextMax,
+    cfg.fulltextChars, cfg.fulltextTiers,
+    cfg.factCheckDomains, cfg.excludeDomains].join('|');
   let h = 5381;
   for (let i = 0; i < raw.length; i++) h = ((h << 5) + h + raw.charCodeAt(i)) | 0;
   return 'rc:' + (h >>> 0).toString(36);

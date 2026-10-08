@@ -1,6 +1,11 @@
 // 验真 · 设置页逻辑
 const FIELDS = ['deepseekKey', 'model', 'baseUrl', 'provider', 'tavilyKey', 'bochaKey',
-  'maxClaims', 'maxResults', 'maxEvidence', 'newsDays', 'judgeVotes', 'cacheDays'];
+  'maxClaims', 'maxResults', 'maxEvidence', 'newsDays', 'judgeVotes', 'cacheDays',
+  'fulltext', 'fulltextMax', 'fulltextChars', 'fulltextTiers',
+  'factCheckDomains', 'excludeDomains'];
+
+const NUMERIC = ['maxClaims', 'maxResults', 'maxEvidence', 'newsDays',
+  'judgeVotes', 'cacheDays', 'fulltext', 'fulltextMax', 'fulltextChars'];
 
 const DEFAULTS = {
   deepseekKey: '',
@@ -15,6 +20,12 @@ const DEFAULTS = {
   newsDays: 30,
   judgeVotes: 1,
   cacheDays: 7,
+  fulltext: 1,
+  fulltextMax: 3,
+  fulltextChars: 3000,
+  fulltextTiers: 'A,B',
+  factCheckDomains: 'piyao.org.cn,kepuchina.cn,fact.qq.com',
+  excludeDomains: 'baijiahao.baidu.com,csdn.net,jianshu.com,sohu.com,163.com,toutiao.com,ifeng.com',
 };
 
 const $ = (id) => document.getElementById(id);
@@ -39,8 +50,7 @@ async function save() {
     const el = $(f);
     if (!el) continue;
     let v = el.value.trim();
-    if (['maxClaims', 'maxResults', 'maxEvidence', 'newsDays',
-      'judgeVotes', 'cacheDays'].includes(f)) {
+    if (NUMERIC.includes(f)) {
       v = Number(v);
       if (!isFinite(v)) v = DEFAULTS[f];
     }

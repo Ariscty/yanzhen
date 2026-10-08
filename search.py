@@ -28,13 +28,31 @@ def _post_json(url, body, headers, timeout=30):
         return json.loads(r.read().decode("utf-8"))
 
 
+def split_domains(value):
+    """把 "a.com, b.com;c.com" 解析成域名列表。兼容逗号和分号（有人会写错）。"""
+    out = []
+    for d in (value or "").replace(";", ",").replace("；", ",").split(","):
+        d = d.strip().lower()
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
 # ---------------------------------------------------------------- Tavily
-def _tavily(cfg, query, limit, news_days=None):
+def _tavily(cfg, query, limit, news_days=None, include_domains=None):
     """Tavily：专为 AI 设计的搜索 API，直接返回干净正文。
     申请：https://app.tavily.com  免费额度：每月 1000 次（basic 搜索 1 次 = 1 credit）
 
     news_days 不为空时走**新闻模式**（topic=news + days=N）：
     只返回最近 N 天的新闻，结果带发布时间。实测有效。
+
+    include_domains（仅辟谣路会用）：Tavily 的这个参数是**硬过滤**——
+    实测（2026-10-08）给一个不存在的域名返回 0 条，给 gov.cn 配辟谣查询也是 0 条。
+    所以它只在"本来就只要辟谣平台结果"的那一路上用。
+
+    ⚠️ 反过来说：**`country` 参数我们刻意不用**。实测它让一条中文政策查询的结果
+    变差（基线 5 个政府站 → 加了 country 混进百度百科和保险公司官网），
+    而且写错值（如 "cn"）会让整个请求 HTTP 400。
     """
     key = cfg.get("TAVILY_API_KEY")
     if not key:
@@ -47,6 +65,11 @@ def _tavily(cfg, query, limit, news_days=None):
         "max_results": limit,
         "search_depth": "basic",
     }
+    ex = split_domains(cfg.get("EXCLUDE_DOMAINS"))
+    if ex:
+        body["exclude_domains"] = ex
+    if include_domains:
+        body["include_domains"] = list(include_domains)
     if news_days:
         body["topic"] = "news"
         body["days"] = int(news_days)
@@ -68,12 +91,15 @@ def _tavily(cfg, query, limit, news_days=None):
 
 
 # ---------------------------------------------------------------- 博查
-def _bocha(cfg, query, limit, news_days=None):
+def _bocha(cfg, query, limit, news_days=None, include_domains=None):
     """博查（中文搜索，国内直连更快）。
 
     ⚠️ 注意：这个适配器**尚未实测验证**（我们还没有博查的 key）。
     接口地址和返回结构按公开文档写的，同时做了多种返回格式的兼容。
     等你拿到 key 后跑一次，如果报错把错误发我，我按真实返回改。
+
+    include_domains / exclude_domains 在这里**不生效** —— 博查的过滤参数名和
+    语义都没验证过，硬套一个猜测上去只会让这个适配器更难调。宁可显式不传。
     """
     key = cfg.get("BOCHA_API_KEY")
     if not key:
@@ -108,7 +134,7 @@ def _bocha(cfg, query, limit, news_days=None):
 
 
 # ---------------------------------------------------------------- 模拟
-def _mock(cfg, query, limit, news_days=None):
+def _mock(cfg, query, limit, news_days=None, include_domains=None):
     """假搜索：不联网、不花额度，用来跑通流程 / 调试界面。"""
     tag = "（新闻模式）" if news_days else ""
     return [
@@ -190,7 +216,13 @@ def clear_cache():
             pass
 
 
-def web_search(cfg, query, limit=5, use_cache=True, news_days=None):
+def web_search(cfg, query, limit=5, use_cache=True, news_days=None,
+               include_domains=None):
+    """检索一次。
+
+    include_domains 只由「辟谣路」传入（见 check.gather_evidence）——
+    它是硬过滤，用错了会让这一路直接空手而归，所以不设成全局配置。
+    """
     name = (cfg.get("SEARCH_PROVIDER") or "tavily").lower()
     fn = PROVIDERS.get(name)
     if fn is None:
@@ -202,14 +234,22 @@ def web_search(cfg, query, limit=5, use_cache=True, news_days=None):
         days = float(cfg.get("CACHE_DAYS", "7") or 0)
     except Exception:
         days = 7.0
-    key = "%s|%s|%d|%s" % (name, query, limit, news_days or "")
+    # 缓存键必须带上域名限定。漏了它的话，"定向检索"和"不限定"会互相串用缓存，
+    # 用户以为自己在用定向检索，实际拿到的是上一次不限定搜出来的结果。
+    dom_key = ",".join(sorted(include_domains or []))
+    key = "%s|%s|%d|%s|%s|%s" % (name, query, limit, news_days or "",
+                                 dom_key, cfg.get("EXCLUDE_DOMAINS") or "")
 
     if use_cache and days > 0:
         hit = _load_cache().get(key)
         if hit and time.time() - hit.get("t", 0) < days * 86400:
-            return hit.get("r", [])
+            # 必须返回**副本**。下游 annotate() 会往结果里塞 tier，fetch.enrich()
+            # 会把 content 换成整页正文 —— 如果直接把缓存里的对象交出去，
+            # 这些改写就落回缓存，同一个进程里下一次核查会读到"上一次改过的结果"，
+            # 结论开始依赖运行顺序。可复现性是这个项目的命根子，不能省这一份拷贝。
+            return [dict(r) for r in hit.get("r", [])]
 
-    results = fn(cfg, query, limit, news_days)
+    results = fn(cfg, query, limit, news_days, include_domains)
 
     if use_cache and days > 0 and results:
         _cache_put(key, {"t": time.time(), "r": results})

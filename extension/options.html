@@ -100,6 +100,64 @@
     </div>
   </fieldset>
 
+  <fieldset>
+    <legend>全文抓取</legend>
+    <div class="hint" style="margin:0 0 8px">
+      搜索只返回一小段摘要，关键限定词（"但孕妇禁用"这类）常常不在摘要里。
+      打开后，会对<b>够格下结论的来源</b>（默认 A/B 级）再抓一次网页正文，让模型看原文。
+    </div>
+    <div class="row">
+      <div>
+        <label for="fulltext">抓取网页正文</label>
+        <select id="fulltext">
+          <option value="1">开（推荐）</option>
+          <option value="0">关（只看搜索摘要，更便宜更快）</option>
+        </select>
+      </div>
+      <div>
+        <label for="fulltextTiers">对哪些等级抓正文</label>
+        <input type="text" id="fulltextTiers" placeholder="A,B">
+        <div class="hint">默认 <code>A,B</code>。C/D 级本来只够当线索，抓它们纯烧 token。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="fulltextMax">每条断言最多抓几页</label>
+        <input type="number" id="fulltextMax" min="0" max="6">
+        <div class="hint">默认 3。</div>
+      </div>
+      <div>
+        <label for="fulltextChars">每页正文最多留多少字</label>
+        <input type="number" id="fulltextChars" min="500" max="10000">
+        <div class="hint">默认 3000。这是判定那一步 token 成本的主要来源。</div>
+      </div>
+    </div>
+    <div class="hint">
+      走 Tavily <code>/extract</code>，约 1 credit / 5 个网页 —— 一次核查通常多花 1~2 credit。
+      没填 Tavily key 时自动跳过，退回只看摘要。
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>检索范围</legend>
+    <label for="factCheckDomains">辟谣路只在这些网站里搜</label>
+    <input type="text" id="factCheckDomains" placeholder="piyao.org.cn,kepuchina.cn,fact.qq.com">
+    <div class="hint">
+      逗号分隔，留空 = 不限。只作用于「辟谣 / fact check」那一路。<br>
+      ⚠️ Tavily 这个参数是<b>硬过滤</b>：这些网站没收录这个话题就直接返回 0 条。
+      实测<b>未限定</b>时 6 条结果里只有 1 条来自辟谣平台，<b>限定后 3 条全是</b>。
+      之所以敢用，是因为这一路空了还有中文/英文/新闻三路兜底。
+    </div>
+
+    <label for="excludeDomains">排除这些网站</label>
+    <input type="text" id="excludeDomains"
+           placeholder="baijiahao.baidu.com,csdn.net,jianshu.com,sohu.com,163.com">
+    <div class="hint">
+      内容农场 / 门户转载。机制是<b>腾出结果位</b>——每种语言只取几条，
+      垃圾占一个就少一个权威来源。实测低钠盐那条查询，A/B 级来源从 1/5 升到 2/5。
+    </div>
+  </fieldset>
+
   <div>
     <button class="primary" id="save">保存</button>
     <button id="test">测试连接</button>

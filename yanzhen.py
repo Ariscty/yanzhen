@@ -126,8 +126,12 @@ def render(claims, results, overall, usages, elapsed, provider, color, debug=Fal
 
         if debug:
             for e in ev:
-                print(paint("      [原始证据][%s] %s" % (e.get("tier"), e.get("url")),
-                            "dim", color))
+                kind = "全文%d字" % e.get("fulltext_len", 0) if e.get("fulltext") else "仅摘要"
+                print(paint("      [原始证据][%s|%s] %s"
+                            % (e.get("tier"), kind, e.get("url")), "dim", color))
+            if claims[i].get("fulltext_error") if i < len(claims) else False:
+                print(paint("      [正文抓取失败] %s" % claims[i]["fulltext_error"],
+                            "yellow", color))
 
     total = check.summarize_usage(usages)
     print()

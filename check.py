@@ -8,6 +8,7 @@
     4. verify_sources  硬闸门：模型引用的网址必须真的在检索结果里，否则剔除
 """
 import concurrent.futures
+import copy
 import hashlib
 import json
 import pathlib
@@ -15,6 +16,7 @@ import re
 import time
 
 import llm
+import fetch
 import search
 import sources
 
@@ -32,7 +34,12 @@ import sources
 #    注意「流程」不只有提示词 —— 检索策略（几路查询、关键词怎么拼）也算。
 #    v8：多了一路「辟谣 / fact check」检索，检索改为并发发出。
 #    v9：判定提示词加第 11 条 —— A/B 级来源明确冲突且无更高层级裁决时，必须判 insufficient。
-PROMPT_VERSION = "9"
+#    v10：证据不再只有搜索摘要 —— 对 A/B 级来源抓网页正文（fetch.py），
+#         判定时看到的是原文，且块里标了「全文 / 摘要」。
+#    v11：加第 12 条提示词护栏（"证据更长 ≠ 可以下更强结论"）—— 评测显示
+#         v10 上线后有样本因为读到更多支持性正文而变得过度自信、反而判错。
+#         检索侧同时加了「辟谣路站点定向」和「排除内容农场」。
+PROMPT_VERSION = "11"
 RESULT_CACHE_FILE = pathlib.Path(__file__).resolve().parent / "cache_result.json"
 _RESULT_CACHE = None
 
@@ -178,6 +185,11 @@ STEP3_SYSTEM = """你是事实核查的第二步：基于证据下结论。
 - D 自媒体百科：微博、公众号、知乎、百科、门户转载、论坛
 - 未分级：无法判断来路
 
+方括号里还有一个词说明**这条证据我们看到了多少**：
+- `全文` = 已抓取整页正文。里面没写的限定条件，基本可以认为原文确实没有。
+- `仅摘要` = 只是搜索返回的片段，**原文未在片段中出现的信息不代表没有**。
+  据此下 supported / refuted 之前要留一分余地；拿不准就判 insufficient。
+
 对每条断言给出一个判定：
 - supported    证据明确支持该断言
 - refuted      证据明确与断言矛盾
@@ -236,6 +248,21 @@ STEP3_SYSTEM = """你是事实核查的第二步：基于证据下结论。
     如果 A/B 级来源**一致地否证**了该断言，仍然判 **refuted**。
     如果只是你自己拿不准、或者证据偏少，那是第 7 条管的事，不是这一条。
 
+12. **证据更长 ≠ 可以下更强的结论**（实测踩过，务必遵守）：
+
+    部分来源下面会标 `全文`，意思是这段是**整页正文**，不是搜索片段。
+    读到的内容变多，**不构成**放宽第 8 条 mixed 门槛的理由，也**不构成**
+    把 insufficient 改判成 supported / refuted 的理由。
+
+    真实反例：一条断言在只看到搜索摘要时被判 `mixed`（措辞绝对 + 存在成文例外，
+    是对的）；看到整页正文后，模型因为读到了更多**支持性**细节而改判成更确定的
+    结论，反而离正确答案更远。在另一条同类样本上，同样的"变得更确定"把它从
+    `mixed` 推到了 `supported`，而正确答案是 `insufficient`。
+
+    所以判断"措辞是否被绝对化"，看的是**有没有成文的例外或范围限制**，
+    不是"支持的证据看起来够不够多"。证据变多只是把同一道门槛喂得更饱，
+    **门槛本身不移动**。
+
 其他要求：
 - sources 里的 url 只能从【证据】中原样复制，**禁止编造任何网址**。
 - reason 用一句中文说清依据，不超过 60 字，并点出关键来源属于哪一级；
@@ -262,11 +289,15 @@ def extract_claims(cfg, text, use_cache=True):
     if use_cache and days > 0:
         hit = _load_claim_cache().get(key)
         if hit and time.time() - hit.get("t", 0) < days * 86400:
-            return hit.get("claims", []), {}
+            # 返回副本：下游 gather_evidence 会往 claim 上挂 evidence、queries、
+            # fulltext_error。直接交出缓存里的对象，这些改写就写回缓存了。
+            return copy.deepcopy(hit.get("claims", [])), {}
 
     prompt = STEP1_SYSTEM.format(max_claims=cfg.get("MAX_CLAIMS", "3"))
-    raw, usage = llm.chat(cfg, prompt, text, max_tokens=2048, temperature=0.0)
-    data = llm.parse_json(raw)
+    try:
+        data, usage = _chat_json(cfg, prompt, text, 2048)
+    except JsonRetryError as e:
+        raise ClaimParseError(str(e), e.usage)
     claims = data.get("claims") or []
     limit = int(cfg.get("MAX_CLAIMS", 3))
     clean = []
@@ -284,7 +315,13 @@ def extract_claims(cfg, text, use_cache=True):
         })
 
     if use_cache and days > 0 and clean:
-        _load_claim_cache()[key] = {"t": time.time(), "claims": clean}
+        # ⚠️ 必须存**副本**。gather_evidence 会往 claim 上挂 evidence / queries /
+        # fulltext_error，而它是就地改写的 —— 存引用的话，下一次任意一条样本
+        # 触发 _save_claim_cache() 时，整个字典（连同这些被改写过的 claim）
+        # 一起落盘，拆断言缓存会越滚越大。实测过：19 条样本跑完，
+        # cache_claims.json 从 281 字节涨到 496KB，里面塞满了整页网页正文。
+        _load_claim_cache()[key] = {"t": time.time(),
+                                    "claims": copy.deepcopy(clean)}
         _save_claim_cache()
     return clean, usage
 
@@ -341,6 +378,7 @@ def gather_evidence(cfg, claims, on_progress=None, max_workers=4):
       1. 中文关键词
       2. 英文关键词（科普/健康/科学类内容，英文资料质量明显更好）
       3. 辟谣 / fact check 关键词（直接去找有没有人已经核查过这句话）
+         —— 这一路会用 FACT_CHECK_DOMAINS 做**站点定向**（见下面的说明）
       4. 若这条断言涉及近期事件且开了新闻模式 → 再加一次新闻搜索（带时间范围）
 
     这几路检索之间**没有任何依赖**，所以并发发出。串行跑纯属白等：
@@ -348,6 +386,7 @@ def gather_evidence(cfg, claims, on_progress=None, max_workers=4):
     限并发 4 —— 搜索服务有限流，一次全发出去容易吃 429。
 
     结果合并去重后按来源等级排序、截断，挂在 claim["evidence"] 上。
+    最后再对够格下结论的证据抓一次网页正文（见 fetch.py），把摘要换掉。
     """
     limit = int(cfg.get("MAX_RESULTS", 4))
     cap = int(cfg.get("MAX_EVIDENCE", 6))
@@ -357,21 +396,27 @@ def gather_evidence(cfg, claims, on_progress=None, max_workers=4):
         news_days = 0
 
     # ① 摊平所有检索任务
+    # 辟谣路的站点定向：Tavily 的 include_domains 是**硬过滤**（实测：给不存在的
+    # 域名返回 0 条，给 gov.cn 配辟谣查询也是 0 条）。所以只在辟谣路用 ——
+    # 这一路本来就只想要辟谣平台的结果，而且它空了还有中文/英文/新闻三路兜底。
+    # 对中文/英文路做定向是拿召回换精准，风险大得多，不划算。
+    fc_domains = search.split_domains(cfg.get("FACT_CHECK_DOMAINS"))
+
     jobs = []
     for idx, c in enumerate(claims):
         q = c["query"] or c["claim"]
-        queries = [(q, None, "中文")]
+        queries = [(q, None, "中文", None)]
         qe = c.get("query_en") or ""
         if qe and _norm_query(qe) != _norm_query(q):
-            queries.append((qe, None, "英文"))
+            queries.append((qe, None, "英文", None))
         fq = _fact_check_query(c)
         if fq and _norm_query(fq) not in (_norm_query(q), _norm_query(qe)):
-            queries.append((fq, None, "辟谣"))
+            queries.append((fq, None, "辟谣", fc_domains or None))
         if c.get("time_sensitive") and news_days > 0:
-            queries.append((q, news_days, "新闻"))
-        c["queries"] = ["%s:%s" % (m, qq) for qq, _, m in queries]
-        for query, days, mode in queries:
-            jobs.append((idx, query, days, mode))
+            queries.append((q, news_days, "新闻", None))
+        c["queries"] = ["%s:%s" % (m, qq) for qq, _, m, _d in queries]
+        for query, days, mode, doms in queries:
+            jobs.append((idx, query, days, mode, doms))
 
     # ② 并发检索。结果按任务序号收集，最后仍按原顺序拼装：
     #    _pick 的排序是稳定的，同等级来源之间靠输入顺序取舍 ——
@@ -379,10 +424,10 @@ def gather_evidence(cfg, claims, on_progress=None, max_workers=4):
     got = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {}
-        for n, (idx, query, days, mode) in enumerate(jobs):
+        for n, (idx, query, days, mode, doms) in enumerate(jobs):
             if on_progress:
                 on_progress(claims[idx], "[%s] %s" % (mode, query))
-            futs[ex.submit(search.web_search, cfg, query, limit, True, days)] = n
+            futs[ex.submit(search.web_search, cfg, query, limit, True, days, doms)] = n
         for fut in concurrent.futures.as_completed(futs):
             n = futs[fut]
             idx = jobs[n][0]
@@ -395,15 +440,49 @@ def gather_evidence(cfg, claims, on_progress=None, max_workers=4):
 
     # ③ 按任务顺序拼回证据池，再按来源等级取舍
     pools = [[] for _ in claims]
-    for n, (idx, _q, _days, _mode) in enumerate(jobs):
+    for n, (idx, _q, _days, _mode, _doms) in enumerate(jobs):
         pools[idx].extend(got.get(n, []))
     for c, pool in zip(claims, pools):
         c["evidence"] = _pick(pool, cap)
+
+    # ④ 补全文：搜索只给摘要，这里对够格下结论的来源（默认 A/B 级）抓一次网页正文。
+    #    放在 _pick **之后**是关键 —— 只抓最终要用的那几页，而不是每路检索的每条结果。
+    if on_progress:
+        on_progress(None, "抓取网页正文…")
+    try:
+        n_full = fetch.enrich(cfg, claims)
+    except Exception as e:
+        # 抓正文失败不该拖垮整条核查：退回摘要照常判定
+        n_full = 0
+        for c in claims:
+            c["fulltext_error"] = "%s: %s" % (type(e).__name__, e)
+    if on_progress:
+        on_progress(None, "正文已取 %d 篇" % n_full)
     return claims
 
 
 class JudgeParseError(Exception):
     """判定模型吐出的 JSON 三级兜底都救不回来。"""
+
+    def __init__(self, msg, usage=None):
+        super().__init__(msg)
+        self.usage = usage or {}
+
+
+class ClaimParseError(Exception):
+    """第一步（拆断言）的 JSON 三级兜底都救不回来。
+
+    和 JudgeParseError 分开，是因为两者的降级方式不同：
+    判定失败可以逐条降成"无法判定"，而拆断言失败意味着后面整条流水线没得跑。
+    """
+
+    def __init__(self, msg, usage=None):
+        super().__init__(msg)
+        self.usage = usage or {}
+
+
+class JsonRetryError(Exception):
+    """模型 JSON 输出经过"重试 + 修复"后仍解析不了。带着 usage，账照记。"""
 
     def __init__(self, msg, usage=None):
         super().__init__(msg)
@@ -421,34 +500,46 @@ def _repair_json(raw):
     return s
 
 
+def _chat_json(cfg, system, user, max_tokens):
+    """调模型 + 解析 JSON，带三级兜底。返回 (data, usage)。
+
+    ① 原样解析 ② 追加一句"必须输出合法 JSON"后重试 ③ 去 ``` 围栏 / 截最外层 {}
+
+    **第一步和第三步都要用这一套。** 原来只有判定那一步有兜底，拆断言那一步
+    直接 `llm.parse_json(raw)` —— 评测里 r04 就死在这里（模型第一条断言吐了
+    被截断的 JSON），一条样本直接报错、白花前面所有的钱。同一类风险不该
+    只在一半的代码里防。
+    """
+    raw, usage = llm.chat(cfg, system, user, max_tokens=max_tokens, temperature=0.0)
+    try:
+        return llm.parse_json(raw), usage
+    except Exception as first:
+        raw2, usage2 = llm.chat(
+            cfg, system,
+            user + "\n\n重要：请严格输出合法完整的 JSON，不要有任何多余文字，不要截断。",
+            max_tokens=min(max_tokens * 2, 16384), temperature=0.0)
+        usage = _merge_usage(usage, usage2)
+        try:
+            return llm.parse_json(raw2), usage
+        except Exception:
+            try:
+                return llm.parse_json(_repair_json(raw2)), usage
+            except Exception as last:
+                raise JsonRetryError(
+                    "%s: %s" % (type(last).__name__, last), usage) from first
+
+
 def _judge_once(cfg, user):
     """跑一次判定，返回 (results, usage)。
 
-    模型偶尔会吐出不完整/不合法的 JSON（回答一长就容易截断），所以有三级兜底：
-      ① 原样解析
-      ② 追加一句"必须输出合法完整 JSON"后重试
-      ③ 去掉 ``` 围栏、截取最外层 {} 再试一次
-    三级都失败才抛 JudgeParseError。
-
+    三级兜底都失败才抛 JudgeParseError。
     **绝不能因为模型吐了坏 JSON 就让整条核查崩掉** —— 评测里真踩到过，
     一条样本直接报错、白花前面所有的钱。由 judge() 接着降级成"无法判定"。
     """
-    raw, usage = llm.chat(cfg, STEP3_SYSTEM, user, max_tokens=6144, temperature=0.0)
     try:
-        data = llm.parse_json(raw)
-    except Exception:
-        raw2, usage2 = llm.chat(
-            cfg, STEP3_SYSTEM,
-            user + "\n\n重要：请严格输出合法完整的 JSON，不要有任何多余文字，不要截断。",
-            max_tokens=8192, temperature=0.0)
-        usage = _merge_usage(usage, usage2)
-        try:
-            data = llm.parse_json(raw2)
-        except Exception:
-            try:
-                data = llm.parse_json(_repair_json(raw2))
-            except Exception as e:
-                raise JudgeParseError("%s: %s" % (type(e).__name__, e), usage)
+        data, usage = _chat_json(cfg, STEP3_SYSTEM, user, 6144)
+    except JsonRetryError as e:
+        raise JudgeParseError(str(e), e.usage)
     return normalize(data.get("results") or []), usage
 
 
@@ -469,8 +560,11 @@ def judge(cfg, claims, votes=None):
             tier = r.get("tier", sources.UNKNOWN)
             if r.get("tier_inferred"):
                 tier += "(据标题推断)"
-            lines.append("- [%s] 标题：%s\n  网址：%s\n  内容：%s"
-                         % (tier, r.get("title", ""), r.get("url", ""), r.get("content", "")))
+            # 标出这条看的是原文还是搜索摘要 —— 摘要可能漏掉关键限定词，
+            # 模型据此知道该不该对"没提到例外"下太强的结论。
+            kind = "全文" if r.get("fulltext") else "仅摘要"
+            lines.append("- [%s|%s] 标题：%s\n  网址：%s\n  内容：%s"
+                         % (tier, kind, r.get("title", ""), r.get("url", ""), r.get("content", "")))
         blocks.append("\n".join(lines))
 
     user = "待核查的断言与证据：\n\n" + "\n\n".join(blocks)
@@ -650,10 +744,25 @@ def run(cfg, text, on_progress=None, use_cache=True):
         hit = _load_result_cache().get(key)
         if hit and time.time() - hit.get("t", 0) < days * 86400:
             say("cache_hit")
-            return hit.get("claims", []), hit.get("results", []), hit.get("usages", [])
+            return (copy.deepcopy(hit.get("claims", [])),
+                    copy.deepcopy(hit.get("results", [])),
+                    hit.get("usages", []))
 
     say("split")
-    claims, u1 = extract_claims(cfg, text)
+    try:
+        claims, u1 = extract_claims(cfg, text)
+    except ClaimParseError as e:
+        # 第一步吐了坏 JSON，重试 + 修复都没救回来。
+        # **绝不往上抛** —— 抛出去整条核查就白跑了（评测里白花过一条样本的钱），
+        # 而这只是模型的一次口误。老实说"这条没法判"才是这个工具该有的态度，
+        # 与 judge 的降级策略保持一致：查不到就直说，不猜。
+        return [], [{
+            "claim": text,
+            "verdict": "insufficient",
+            "confidence": 0.0,
+            "reason": "拆断言这一步模型输出无法解析（已重试并尝试修复），不作判定：%s" % e,
+            "sources": [],
+        }], [getattr(e, "usage", {})]
     if not claims:
         return [], [], [u1]
 

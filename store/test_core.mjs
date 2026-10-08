@@ -67,7 +67,7 @@ const core = await import(pathToFileURL(join(EXT, 'core.js')).href);
 console.log('\n【PROMPT_VERSION】');
 // ⚠️ 改提示词或改流程后这里要跟着改 —— 它同时在提醒你：版本号必须 +1，
 //    否则结果缓存不会失效，评测会返回旧结论。
-ok('版本号（Python 版 check.py 必须一致）', core.PROMPT_VERSION, '9');
+ok('版本号（Python 版 check.py 必须一致）', core.PROMPT_VERSION, '11');
 
 console.log('\n【来源分级 tierOf】');
 ok('中国政府网', core.tierOf('https://www.gov.cn/a.htm')[0], 'A 官方一手');

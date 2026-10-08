@@ -8,6 +8,7 @@
 cache_search.json
 cache_result.json
 cache_claims.json
+cache_fetch.json
 eval/*.partial.json
 eval/*.smoke.md
 
@@ -28,3 +29,8 @@ venv/
 Thumbs.db
 *.log
 out/
+
+# Windows 自己长出来的垃圾：某个进程没展开环境变量，把
+# %SystemDrive%\ProgramData\...\Caches 写到了当前工作目录。
+# 删掉还会再回来，所以直接忽略，别让它污染 git status。
+%SystemDrive%/

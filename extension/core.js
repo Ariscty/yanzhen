@@ -9,7 +9,12 @@
 //    这个值和 Python 版 check.py 的 PROMPT_VERSION 必须保持一致。
 //    v8：多了一路「辟谣 / fact check」检索，检索改为并发发出。
 //    v9：判定提示词加第 11 条 —— A/B 级来源明确冲突且无更高层级裁决时，必须判 insufficient。
-export const PROMPT_VERSION = '9';
+//    v10：证据不再只有搜索摘要 —— 对 A/B 级来源抓网页正文（Tavily /extract），
+//         判定时看到的是原文，且块里标了「全文 / 摘要」。
+//    v11：加第 12 条提示词护栏（"证据更长 ≠ 可以下更强结论"）—— 评测显示
+//         v10 上线后有样本因为读到更多支持性正文而变得过度自信、反而判错。
+//         检索侧同时加了「辟谣路站点定向」和「排除内容农场」。
+export const PROMPT_VERSION = '11';
 
 // ============================================================ 来源分级
 // 中文互联网上，「一份政府公告」和「一条自媒体转述」是完全不同强度的证据。
@@ -227,6 +232,11 @@ const STEP3_SYSTEM = `你是事实核查的第二步：基于证据下结论。
 - D 自媒体百科：微博、公众号、知乎、百科、门户转载、论坛
 - 未分级：无法判断来路
 
+方括号里还有一个词说明**这条证据我们看到了多少**：
+- \`全文\` = 已抓取整页正文。里面没写的限定条件，基本可以认为原文确实没有。
+- \`仅摘要\` = 只是搜索返回的片段，**原文未在片段中出现的信息不代表没有**。
+  据此下 supported / refuted 之前要留一分余地；拿不准就判 insufficient。
+
 对每条断言给出一个判定：
 - supported    证据明确支持该断言
 - refuted      证据明确与断言矛盾
@@ -284,6 +294,21 @@ const STEP3_SYSTEM = `你是事实核查的第二步：基于证据下结论。
     只有证据里**确实存在相互冲突的 A/B 级来源**时才适用。
     如果 A/B 级来源**一致地否证**了该断言，仍然判 **refuted**。
     如果只是你自己拿不准、或者证据偏少，那是第 7 条管的事，不是这一条。
+
+12. **证据更长 ≠ 可以下更强的结论**（实测踩过，务必遵守）：
+
+    部分来源下面会标 \`全文\`，意思是这段是**整页正文**，不是搜索片段。
+    读到的内容变多，**不构成**放宽第 8 条 mixed 门槛的理由，也**不构成**
+    把 insufficient 改判成 supported / refuted 的理由。
+
+    真实反例：一条断言在只看到搜索摘要时被判 \`mixed\`（措辞绝对 + 存在成文例外，
+    是对的）；看到整页正文后，模型因为读到了更多**支持性**细节而改判成更确定的
+    结论，反而离正确答案更远。在另一条同类样本上，同样的"变得更确定"把它从
+    \`mixed\` 推到了 \`supported\`，而正确答案是 \`insufficient\`。
+
+    所以判断"措辞是否被绝对化"，看的是**有没有成文的例外或范围限制**，
+    不是"支持的证据看起来够不够多"。证据变多只是把同一道门槛喂得更饱，
+    **门槛本身不移动**。
 
 其他要求：
 - sources 里的 url 只能从【证据】中原样复制，**禁止编造任何网址**。
@@ -372,11 +397,32 @@ async function callDeepSeek(cfg, system, user, opts) {
 
 // ---------------------------------------------------------- 搜索适配器
 // 不绑定任何一家：用户填哪家的 key 就用哪家（与命令行版同一套设计）
-async function tavilySearch(cfg, query, limit, newsDays) {
+
+/** "a.com, b.com;c.com" -> ['a.com','b.com','c.com']（逗号分号都认，有人会写错） */
+function splitDomains(value) {
+  const out = [];
+  for (let d of String(value || '').replace(/[;；]/g, ',').split(',')) {
+    d = d.trim().toLowerCase();
+    if (d && !out.includes(d)) out.push(d);
+  }
+  return out;
+}
+
+async function tavilySearch(cfg, query, limit, newsDays, includeDomains) {
   if (!cfg.tavilyKey) throw new Error('没填 Tavily key —— 去 https://app.tavily.com 申请（每月 1000 次免费）');
   const body = {
     api_key: cfg.tavilyKey, query, max_results: limit, search_depth: 'basic',
   };
+  // 排除内容农场。有效的机制是**腾出结果位** —— max_results 是固定的几个位子，
+  // 垃圾占一个就少一个权威来源（实测：低钠盐那条查询 A/B 级从 1/5 升到 2/5）。
+  const ex = splitDomains(cfg.excludeDomains);
+  if (ex.length) body.exclude_domains = ex;
+  // 站点定向（仅辟谣路用）：Tavily 这个参数是**硬过滤** ——
+  // 实测给不存在的域名返回 0 条，给 gov.cn 配辟谣查询也是 0 条。
+  // 所以只在"本来就只想要辟谣平台结果"的那一路用，空了还有三路兜底。
+  if (includeDomains && includeDomains.length) {
+    body.include_domains = includeDomains.slice(0, 300);
+  }
   // newsDays 有值时走新闻模式（topic=news + days=N）：只返回最近 N 天的新闻，结果带发布时间
   if (newsDays) {
     body.topic = 'news';
@@ -399,6 +445,8 @@ async function tavilySearch(cfg, query, limit, newsDays) {
   });
 }
 
+// 注意：域名过滤（include/exclude_domains）在博查这边**不生效** ——
+// 博查的过滤参数名和语义都没验证过，硬套一个猜测上去只会让这个适配器更难调。
 async function bochaSearch(cfg, query, limit, newsDays) {
   if (!cfg.bochaKey) throw new Error('没填博查 key');
   const body = { query, count: limit, summary: true };
@@ -440,12 +488,120 @@ async function mockSearch(cfg, query, limit, newsDays) {
   ].slice(0, limit);
 }
 
-export async function webSearch(cfg, query, limit, newsDays) {
+export async function webSearch(cfg, query, limit, newsDays, includeDomains) {
   const p = (cfg.provider || 'tavily').toLowerCase();
-  if (p === 'tavily') return tavilySearch(cfg, query, limit, newsDays);
+  if (p === 'tavily') return tavilySearch(cfg, query, limit, newsDays, includeDomains);
   if (p === 'bocha') return bochaSearch(cfg, query, limit, newsDays);
   if (p === 'mock') return mockSearch(cfg, query, limit, newsDays);
   throw new Error('未知的搜索来源：' + p);
+}
+
+// ---------------------------------------------------------- 全文抓取
+// 搜索只返回摘要片段，关键限定词（"但肾功能不全者禁用"这类）常常不在摘要里。
+// 只看摘要，模型容易把一句被绝对化的原话判成「可信」；看到正文才知道有例外。
+//
+// 位置很关键：放在 pickEvidence **之后** —— 只抓最终要用的那几页（默认每条断言 3 页），
+// 而不是每路检索的每条结果。一次核查有 6~9 路检索、每路 4 条，全抓等于一次拉回
+// 30 多页全文，绝大部分根本用不上，纯烧时间和 token。
+//
+// 这里只走 Tavily /extract：api.tavily.com 已在 host_permissions 里。
+// 命令行版还有个免费的 http 直抓通道，但浏览器里要抓任意网站得申请 <all_urls>
+// 主机权限 —— 为了一个兜底通道把商店审核风险拉高，不划算。所以扩展端不做。
+
+const MD_IMG = /!\[[^\]]*\]\([^)]*\)/g;
+const MD_LINK = /\[([^\]]*)\]\([^)]*\)/g;
+
+/** Tavily 返回 markdown，带图片语法和链接 URL 噪声。图片直接删（本来也读不了），
+ *  链接只留文字 —— 网址白占 token，而且模型已经能从 url 字段看到。 */
+function cleanMarkdown(raw) {
+  let t = String(raw || '').replace(MD_IMG, ' ').replace(MD_LINK, '$1');
+  t = t.replace(/[ \t\u00a0\u3000]+/g, ' ');
+  return t.split('\n').map((ln) => ln.trim().replace(/^[*#>\-]+/, '').trim())
+    .filter(Boolean).join('\n');
+}
+
+/** 网址归一化：Tavily 可能按重定向后的地址返回，得对回我们请求的那条。 */
+function urlKey(u) {
+  return String(u || '').trim().replace(/\/+$/, '')
+    .replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+}
+
+async function tavilyExtract(cfg, urls) {
+  if (!cfg.tavilyKey) throw new Error('没填 Tavily key');
+  const out = {};
+  // 一次最多 20 个网址，超了分批
+  for (let i = 0; i < urls.length; i += 20) {
+    const batch = urls.slice(i, i + 20);
+    const res = await fetchTimeout('https://api.tavily.com/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: cfg.tavilyKey, urls: batch,
+        extract_depth: 'basic', format: 'markdown',
+      }),
+    }, 60000);
+    if (!res.ok) throw new Error(`Tavily 抓正文返回 HTTP ${res.status}`);
+    const data = await res.json();
+    for (const r of (data.results || [])) {
+      const body = cleanMarkdown(r.raw_content || '');
+      if (!body) continue;
+      const hit = batch.find((b) => urlKey(b) === urlKey(r.url));
+      out[hit || r.url] = body;
+    }
+  }
+  return out;
+}
+
+/** 给每条断言里够格下结论的证据补正文。就地改写，返回补成功的篇数。
+ *  只抓 fulltextTiers 指定的等级（默认 A、B）—— C/D 级本来只够当线索，
+ *  给它们抓全文是白烧 token。 */
+async function enrichEvidence(cfg, claims) {
+  const enabled = String(cfg.fulltext).toLowerCase();
+  if (enabled === '0' || enabled === 'off' || enabled === 'false' || enabled === '') return 0;
+  if (!cfg.tavilyKey) return 0;      // 没有 key 就老实退化成只看摘要
+
+  const allowed = new Set(String(cfg.fulltextTiers || 'A,B').split(',')
+    .map((s) => s.trim().toUpperCase()).filter(Boolean));
+  if (!allowed.size) return 0;
+
+  const cap = Number(cfg.fulltextMax) || 3;
+  const chars = Number(cfg.fulltextChars) || 3000;
+  const targets = [];
+  for (const c of claims) {
+    let n = 0;
+    for (const e of (c.evidence || [])) {
+      if (!allowed.has(tierLetter(e.tier))) continue;
+      if (n >= cap) break;
+      e.fulltext = false;
+      if (e.url) { targets.push(e); n += 1; }
+    }
+  }
+  if (!targets.length) return 0;
+
+  const urls = [...new Set(targets.map((e) => e.url))];
+  let texts = {};
+  try {
+    texts = await tavilyExtract(cfg, urls);
+  } catch (e) {
+    // 抓不到正文不该拖垮整条核查：退回摘要照常判定
+    for (const c of claims) c.fulltextError = String(e.message || e);
+    return 0;
+  }
+
+  let hit = 0;
+  for (const e of targets) {
+    const txt = texts[e.url];
+    if (!txt) continue;
+    e.summary = e.content;              // 原摘要留着，方便排查
+    e.content = txt.slice(0, chars);
+    e.fulltext = true;
+    e.fulltextLen = txt.length;
+    hit += 1;
+  }
+  if (hit === 0) for (const c of claims) {
+    if ((c.evidence || []).length) c.fulltextError = 'Tavily 没返回正文';
+  }
+  return hit;
 }
 
 // 证据取舍：按来源等级排序，A/B 级先占位置，弱来源被挤掉。
@@ -610,23 +766,26 @@ export async function checkText(cfg, text, onProgress) {
   // 这几路之间**没有任何依赖**，所以并发发出。
   // （原来是 claims × queries 两层 for + await，6~9 路串行，白等十几秒。）
   say('search');
+  // 辟谣路的站点定向。Tavily 的 include_domains 是硬过滤，所以只给这一路用 ——
+  // 它本来就只想要辟谣平台的结果，空了还有中文/英文/新闻三路兜底。
+  const fcDomains = splitDomains(cfg.factCheckDomains);
   const jobs = [];
   claims.forEach((c, ci) => {
     const q = c.query || c.claim;
-    const plan = [[q, null, '中文']];
+    const plan = [[q, null, '中文', null]];
     if (c.query_en && normQuery(c.query_en) !== normQuery(q)) {
-      plan.push([c.query_en, null, '英文']);
+      plan.push([c.query_en, null, '英文', null]);
     }
     const fq = factCheckQuery(c);
     if (fq && normQuery(fq) !== normQuery(q)
         && normQuery(fq) !== normQuery(c.query_en || '')) {
-      plan.push([fq, null, '辟谣']);
+      plan.push([fq, null, '辟谣', fcDomains.length ? fcDomains : null]);
     }
     if (c.time_sensitive && Number(cfg.newsDays) > 0) {
-      plan.push([q, Number(cfg.newsDays), '新闻']);
+      plan.push([q, Number(cfg.newsDays), '新闻', null]);
     }
     c.queries = plan.map(([qq, , mode]) => `${mode}:${qq}`);
-    plan.forEach(([qq, days, mode]) => jobs.push({ ci, q: qq, days, mode, err: '' }));
+    plan.forEach(([qq, days, mode, doms]) => jobs.push({ ci, q: qq, days, mode, doms, err: '' }));
   });
 
   say('searching', `并发检索 ${jobs.length} 路…`);
@@ -637,7 +796,7 @@ export async function checkText(cfg, text, onProgress) {
     await Promise.all(jobs.slice(i, i + MAX_PARALLEL).map(async (j, k) => {
       const n = i + k;
       try {
-        got[n] = (await webSearch(cfg, j.q, cfg.maxResults, j.days)).map(annotate);
+        got[n] = (await webSearch(cfg, j.q, cfg.maxResults, j.days, j.doms)).map(annotate);
       } catch (e) {
         j.err = String(e.message || e);
       }
@@ -657,6 +816,11 @@ export async function checkText(cfg, text, onProgress) {
     if (bad) c.searchError = bad.err;
   });
 
+  // 第二步半：给够格下结论的证据补网页正文（搜索只给摘要，摘要会漏掉关键限定词）
+  say('searching', '抓取网页正文…');
+  const nFull = await enrichEvidence(cfg, claims);
+  say('searching', `正文已取 ${nFull} 篇`);
+
   // 第三步：判定（可选多次取多数）
   say('judge');
   const blocks = claims.map((c, i) => {
@@ -664,7 +828,10 @@ export async function checkText(cfg, text, onProgress) {
     if (!(c.evidence || []).length) lines.push('（没有检索到任何结果）');
     for (const e of (c.evidence || [])) {
       const tier = e.tier + (e.tierInferred ? '(据标题推断)' : '');
-      lines.push(`- [${tier}] 标题：${e.title}\n  网址：${e.url}\n  内容：${e.content}`);
+      // 标出这条看的是原文还是搜索摘要 —— 摘要可能漏掉关键限定词，
+      // 模型据此知道该不该对"没提到例外"下太强的结论。
+      const kind = e.fulltext ? '全文' : '仅摘要';
+      lines.push(`- [${tier}|${kind}] 标题：${e.title}\n  网址：${e.url}\n  内容：${e.content}`);
     }
     return lines.join('\n');
   });
